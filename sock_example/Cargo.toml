@@ -1,0 +1,16 @@
+[package]
+name = "sock_example"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+aya = "0.13.1"
+env_logger = "0.11.9"
+libc = "0.2.182"
+log = "0.4.29"
+thiserror = "2.0.18"
+
+[build-dependencies]
+anyhow = "1.0.101"
+aya-build = "0.1.3"
+cargo_metadata = "0.23.1"

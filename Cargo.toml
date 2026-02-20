@@ -1,0 +1,8 @@
+[workspace]
+resolver = "3"
+members = ["ebpf_example","sock_example"]
+default-members = ["sock_example"]
+
+[profile.release.package.ebpf_example]
+debug = 2
+codegen-units = 1

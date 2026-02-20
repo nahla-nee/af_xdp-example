@@ -1,0 +1,15 @@
+[package]
+name = "ebpf_example"
+version = "0.1.0"
+edition = "2024"
+
+[build-dependencies]
+which = "8.0.0"
+
+[dependencies]
+aya-ebpf = "0.1.1"
+
+[[bin]]
+# aya needs a different name from the crate name
+name = "ebpf_example_prog"
+path = "src/main.rs"
