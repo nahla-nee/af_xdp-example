@@ -17,14 +17,14 @@ use libc::{xdp_mmap_offsets, xdp_ring_offset};
 use log::debug;
 use thiserror::Error;
 
-/// A Simple wrapper around a [NonNull] pointer to `T` that implements [Deref] and [DerefMut]
+/// A wrapper around a [NonNull] pointer to `T` that implements [Deref] and [DerefMut]
 /// Invariant: The pointer must be convertible to a reference as specified by [NonNull::as_ref] and
 /// [NonNull::as_mut]
 #[repr(transparent)]
 struct DerefNonNull<T>(NonNull<T>);
 
 impl<T> DerefNonNull<T> {
-    /// Returns a wrapped [NonNull] pointer
+    /// Returns a [DerefNonNull] wrapping the [NonNull] pointer
     ///
     /// # Safety
     /// When calling this method you must ensure that the pointer is convertible to a reference per
@@ -53,6 +53,60 @@ impl<T> DerefMut for DerefNonNull<T> {
     }
 }
 
+/// A wrapper around a [[T; N]] buffer that is shared with and concurrently modified by the kernel
+/// Invariants:
+/// * The wrapped pointer is convertible to a reference as specified by the docs in
+///   [NonNull::as_ref] and [NonNull::as_mut]
+/// * The memory pointed to by the underlying pointer is at least large enough to hold N many Ts
+#[repr(transparent)]
+struct SharedBuffer<T, const N: usize>(NonNull<[T; N]>);
+
+impl<T, const N: usize> SharedBuffer<T, N> {
+    /// Returns a [SharedBuffer] wrapping the [NonNull] pointer
+    ///
+    /// # Safety:
+    /// THe pointer passed must uphold the struct invariants
+    pub unsafe fn new(ptr: NonNull<[T; N]>) -> Self {
+        Self(ptr)
+    }
+
+    /// Gets a reference to the element at the specified buffer index
+    ///
+    /// # Safety
+    /// You must ensure that the given index is safe to cast as a reference per the requirements
+    /// specified by [NonNull] in the documentation for [NonNull::as_ref]. Especially the
+    /// requirement that the data referenced may not be modified while this reference is alive,
+    /// including kernel modifications.
+    pub unsafe fn get_unchecked(&self, idx: usize) -> &T {
+        assert!(idx < N, "Index out of range");
+        // Safety:
+        // we know that idx is in a valid range
+        unsafe { self.0.cast::<T>().add(idx).as_ref() }
+    }
+
+    /// Gets a mutable reference to the element at the specified buffer index
+    ///
+    /// # Safety
+    /// You must ensure that the given index is safe to cast as a reference per the requirements
+    /// specified by [NonNull] in the documentation for [NonNull::as_mut]. Especially the
+    /// requirement that the data referenced may not be modified while this reference is alive,
+    /// including kernel modifications.
+    pub unsafe fn get_unchecked_mut(&mut self, idx: usize) -> &mut T {
+        assert!(idx < N, "Index out of range");
+        unsafe { self.0.cast::<T>().add(idx).as_mut() }
+    }
+
+    /// Gets a const pointer to the buffer
+    pub fn as_ptr(&self) -> *const [T; N] {
+        self.0.as_ptr()
+    }
+
+    /// Gets a mut pointer to the buffer
+    pub fn as_mut_ptr(&self) -> *mut [T; N] {
+        self.0.as_ptr()
+    }
+}
+
 #[derive(Error, Debug)]
 pub enum UmemError {
     #[error("Failed to allocate umem buffer: {0}")]
@@ -67,30 +121,34 @@ pub enum UmemError {
 
 /// A safe wrapper around a page-aligned UMEM buffer along with its associated fill and completion
 /// buffers.
-struct Umem<const COUNT: usize, const LEN: usize, const FILL: usize, const COMP: usize> {
-    buffer: DerefNonNull<[u8; LEN]>,
+struct Umem<const COUNT: usize, const SIZE: usize, const FILL: usize, const COMP: usize> {
+    buffer: SharedBuffer<[u8; SIZE], COUNT>,
     fill: FillBuffer<FILL>,
     comp: CompletionBuffer<COMP>,
 }
 
-impl<const COUNT: usize, const LEN: usize, const FILL: usize, const COMP: usize>
-    Umem<COUNT, LEN, FILL, COMP>
+impl<const COUNT: usize, const SIZE: usize, const FILL: usize, const COMP: usize>
+    Umem<COUNT, SIZE, FILL, COMP>
 {
-    const CHUNK_SIZE: usize = LEN / COUNT;
+    const LEN: usize = COUNT * SIZE;
 
     /// Allocates a page aligned buffer of size [Self::BUF_LEN]
     pub fn new(fd: &XdpFd, offsets: xdp_mmap_offsets) -> Result<Self, UmemError> {
         const {
-            assert!(COUNT.is_power_of_two(), "Umem chunk count must be a power of 2");
-            assert!(LEN.is_power_of_two(), "Umem chunk length must be a power of 2");
-            assert!(LEN & COUNT == 0, "Umem chunk count must divide buffer size");
-            assert!(Self::CHUNK_SIZE.is_power_of_two(), "Umem chunk size must be a power of 2");
+            assert!(
+                SIZE >= 2048,
+                "UMEM chunk size must greater than or equal to 2048"
+            );
+            assert!(
+                SIZE.is_power_of_two(),
+                "UMEM chunk size must be a power of 2"
+            );
         }
 
-        let addr = unsafe {
+        let buffer = unsafe {
             let addr = libc::mmap(
                 std::ptr::null_mut(),
-                LEN,
+                Self::LEN,
                 libc::PROT_READ | libc::PROT_WRITE,
                 libc::MAP_ANONYMOUS | libc::MAP_PRIVATE,
                 -1,
@@ -104,27 +162,28 @@ impl<const COUNT: usize, const LEN: usize, const FILL: usize, const COMP: usize>
                 Some(NonNull::new(addr).expect("NonNull new failed somehow"))
             }
         };
-        let addr = addr.ok_or_else(|| UmemError::Alloc(ioError::last_os_error()))?;
+        let buffer = unsafe {
+            SharedBuffer::new(
+                buffer
+                    .ok_or_else(|| UmemError::Alloc(ioError::last_os_error()))?
+                    .cast(),
+            )
+        };
 
-        let buffer = unsafe { DerefNonNull::new(addr.cast()) };
         Self::register_buffer(&buffer, fd).map_err(UmemError::Register)?;
 
         let fill = FillBuffer::new(fd, offsets).map_err(UmemError::FillBuffer)?;
         let comp = CompletionBuffer::new(fd, offsets).map_err(UmemError::CompletionBuffer)?;
 
-        Ok(Umem {
-            buffer,
-            fill,
-            comp,
-        })
+        Ok(Umem { buffer, fill, comp })
     }
 
     /// Registers the [Umem] buffer with the specified [XdpSock]
-    fn register_buffer(buf: &DerefNonNull<[u8; LEN]>, fd: &XdpFd) -> Result<(), ioError> {
+    fn register_buffer(buf: &SharedBuffer<[u8; SIZE], COUNT>, fd: &XdpFd) -> Result<(), ioError> {
         let umem_reg = libc::xdp_umem_reg {
             addr: buf.as_ptr() as _,
-            len: LEN as _,
-            chunk_size: Self::CHUNK_SIZE as _,
+            len: Self::LEN as _,
+            chunk_size: SIZE as _,
             headroom: 0,
             flags: 0,
             tx_metadata_len: 0,
@@ -135,15 +194,15 @@ impl<const COUNT: usize, const LEN: usize, const FILL: usize, const COMP: usize>
     }
 }
 
-impl<const COUNT: usize, const LEN: usize, const FILL: usize, const COMP: usize> Drop for
-    Umem<COUNT, LEN, FILL, COMP>
+impl<const COUNT: usize, const SIZE: usize, const FILL: usize, const COMP: usize> Drop
+    for Umem<COUNT, SIZE, FILL, COMP>
 {
     fn drop(&mut self) {
         // Safety:
         // We acquired this memory through mmap and therefor its safe to pass it to munmap to free
         // it. The allocation always has the size Self::BUF_LEN
         unsafe {
-            libc::munmap(self.buffer.as_mut_ptr().cast(), LEN);
+            libc::munmap(self.buffer.as_mut_ptr().cast(), Self::LEN);
         }
     }
 }
@@ -163,7 +222,7 @@ struct RingBuffer<T, const N: usize> {
     producer: DerefNonNull<AtomicU32>,
     consumer: DerefNonNull<AtomicU32>,
     flags: DerefNonNull<AtomicU32>,
-    data: DerefNonNull<[T; N]>,
+    data: SharedBuffer<T, N>,
     cached_prod: u32,
     cached_cons: u32,
 }
@@ -231,7 +290,7 @@ impl<T, const N: usize> RingBuffer<T, N> {
                 DerefNonNull::<AtomicU32>::new(addr.add(offset.producer as _).cast()),
                 DerefNonNull::<AtomicU32>::new(addr.add(offset.consumer as _).cast()),
                 DerefNonNull::<AtomicU32>::new(addr.add(offset.flags as _).cast()),
-                DerefNonNull::new(addr.add(offset.desc as _).cast()),
+                SharedBuffer::new(addr.add(offset.desc as _).cast()),
             )
         };
 
@@ -442,10 +501,7 @@ pub struct NetworkInterface {
 
 impl NetworkInterface {
     pub fn new(name: String, index: u32) -> Self {
-        NetworkInterface {
-            name,
-            index,
-        }
+        NetworkInterface { name, index }
     }
 }
 
@@ -474,11 +530,16 @@ pub struct XdpSock {
     /// The XDP socket file descriptor
     fd: XdpFd,
     /// The UMEM buffer, fill and completion buffers
-    umem: Umem<{Self::UMEM_CHUNK_COUNT}, {Self::UMEM_LEN}, {Self::RING_LEN}, {Self::RING_LEN}>,
+    umem: Umem<
+        { Self::UMEM_CHUNK_COUNT },
+        { Self::UMEM_CHUNK_SIZE },
+        { Self::RING_LEN },
+        { Self::RING_LEN },
+    >,
     /// The RX buffer
-    rx: RxBuffer<{Self::RING_LEN}>,
+    rx: RxBuffer<{ Self::RING_LEN }>,
     /// The TX buffer
-    tx: TxBuffer<{Self::RING_LEN}>,
+    tx: TxBuffer<{ Self::RING_LEN }>,
     /// NIC's info
     nic: NetworkInterface,
 }
@@ -486,7 +547,6 @@ pub struct XdpSock {
 impl XdpSock {
     const UMEM_CHUNK_SIZE: usize = 4096;
     const UMEM_CHUNK_COUNT: usize = 4096;
-    const UMEM_LEN: usize = Self::UMEM_CHUNK_SIZE * Self::UMEM_CHUNK_COUNT;
     const RING_LEN: usize = 1024;
 
     /// Attempts to create an [XdpSock]
@@ -761,15 +821,18 @@ fn main() {
         .expect("Failed to attach program to NIC");
 
     let mut map = XskMap::try_from(bpf.map_mut("XSK_MAP").expect("Failed to load map"))
-            .expect("Failed to turn map into hashmap");
+        .expect("Failed to turn map into hashmap");
 
     map.set(0, sock.fd.as_raw_fd(), 0) // key, value, flags
         .expect("Failed to insert queue -> xsk mapping");
 
     // getting the 0th entry shouldn't fail
-    *sock.umem.fill.data.get_mut(0).unwrap() = 0;
+    *unsafe { sock.umem.fill.data.get_unchecked_mut(0) } = 0;
     sock.umem.fill.cached_prod += 1;
-    sock.umem.fill.producer.store(sock.umem.fill.cached_prod, Ordering::Release);
+    sock.umem
+        .fill
+        .producer
+        .store(sock.umem.fill.cached_prod, Ordering::Release);
 
     loop {
         let new_prod = sock.rx.producer.load(Ordering::Acquire);
@@ -790,16 +853,14 @@ fn main() {
     // not *actual* end, but end of data we're using
     let chunk_end = chunk_start + data.len();
 
-    sock.umem.buffer[chunk_start..chunk_end].copy_from_slice(data);
-    let tx_entry = sock
-        .tx
-        .data
-        .get_mut(0)
-        .expect("Getting the 0th index shouldn't fail");
+    unsafe { sock.umem.buffer.get_unchecked_mut(0) }.as_mut_slice()[chunk_start..chunk_end]
+        .copy_from_slice(data);
 
-    tx_entry.addr = chunk_start as _;
-    tx_entry.len = data.len() as _;
-    tx_entry.options = 0;
+    *unsafe { sock.tx.data.get_unchecked_mut(0) } = libc::xdp_desc {
+        addr: chunk_start as _,
+        len: data.len() as _,
+        options: 0,
+    };
 
     sock.tx.cached_prod += 1;
     sock.tx
@@ -825,10 +886,7 @@ fn main() {
         let new_prod = sock.umem.comp.producer.load(Ordering::Acquire);
         if new_prod > sock.umem.comp.cached_prod {
             sock.umem.comp.cached_prod = new_prod;
-            sock.umem
-                .comp
-                .consumer
-                .store(new_prod, Ordering::Release);
+            sock.umem.comp.consumer.store(new_prod, Ordering::Release);
             break;
         }
     }
