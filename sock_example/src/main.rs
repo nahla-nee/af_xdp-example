@@ -826,7 +826,7 @@ fn main() {
     map.set(0, sock.fd.as_raw_fd(), 0) // key, value, flags
         .expect("Failed to insert queue -> xsk mapping");
 
-    // getting the 0th entry shouldn't fail
+    // Safety: we own the 0th chunk at the start so we can take a reference to it
     *unsafe { sock.umem.fill.data.get_unchecked_mut(0) } = 0;
     sock.umem.fill.cached_prod += 1;
     sock.umem
@@ -853,10 +853,14 @@ fn main() {
     // not *actual* end, but end of data we're using
     let chunk_end = chunk_start + data.len();
 
+    // Safety: we own the 0th chunk because it was returned to us in the rx buffer above. we can
+    // safely take a reference to it.
     unsafe { sock.umem.buffer.get_unchecked_mut(0) }.as_mut_slice()[chunk_start..chunk_end]
         .copy_from_slice(data);
 
-    *unsafe { sock.tx.data.get_unchecked_mut(0) } = libc::xdp_desc {
+    let idx = sock.tx.cached_prod as _;
+    // Safety: we own the index at cached_prod by definition
+    *unsafe { sock.tx.data.get_unchecked_mut(idx) } = libc::xdp_desc {
         addr: chunk_start as _,
         len: data.len() as _,
         options: 0,
